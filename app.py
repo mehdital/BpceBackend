@@ -19,7 +19,7 @@ API_VER = "2025-01-01-preview"
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="IA Accessibility Auditor (Unified)", version="2.0.0")
+app = FastAPI(title="IA Accessibility Auditor (Unified)", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # restreindre en prod
@@ -40,7 +40,7 @@ class Filters(BaseModel):
 class AuditRequest(BaseModel):
     url: HttpUrl
     filters: Filters
-    screenshot_url: Optional[str] = None           # image de la page (facilite le test "visuel vs DOM")
+    screenshot_url: Optional[str] = None           # image de la page (pour test visuel vs DOM)
     screenshot_base64: Optional[str] = None        # "data:image/png;base64,..." ou base64 pur
 
 # =========================
@@ -127,7 +127,7 @@ def robust_json_parse(raw: str):
         return []
 
 # =========================
-# Azure OpenAI
+# Azure OpenAI — client REST
 # =========================
 def ensure_azure_config():
     if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT and AZURE_OPENAI_API_KEY):
@@ -150,7 +150,23 @@ async def call_azure_chat(messages: List[Dict[str, Any]], max_tokens: int = 500)
     return data["choices"][0]["message"]["content"]
 
 # =========================
-# Prompts Vision
+# Helpers contenu vision
+# =========================
+def _image_item(url_or_b64: str) -> Dict[str, Any]:
+    """
+    Construit un item 'image_url' conforme à l'API:
+    {"type":"image_url","image_url":{"url":"https://..."}}
+    Supporte aussi Data URL ou base64 pur.
+    """
+    if url_or_b64.startswith("http"):
+        return {"type": "image_url", "image_url": {"url": url_or_b64}}
+    if url_or_b64.startswith("data:image/"):
+        return {"type": "image_url", "image_url": {"url": url_or_b64}}
+    # Base64 pur -> Data URL PNG
+    return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{url_or_b64}"}}
+
+# =========================
+# Prompts (ALT / OCR / HEADINGS / LINKS)
 # =========================
 def build_msgs_alt(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[str, Any]]:
     system = {
@@ -161,17 +177,17 @@ def build_msgs_alt(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[st
             'Format: [{"judgment":"Pertinent|Non pertinent|Ambigu|Inconclusif","explanation":"...","suggestion":"...","confidence":0.0}]'
         )
     }
-    user_content: List[Dict[str, Any]] = [
-        {"type": "input_text", "text": f"Langue de la page: {page_lang or 'fr'}."},
-        {"type": "input_text", "text": "Règle: RGAA 1.1 — Pertinence du texte alternatif. Un objet JSON par bloc, dans l’ordre."}
+    user_items: List[Dict[str, Any]] = [
+        {"type": "text", "text": f"Langue de la page: {page_lang or 'fr'}."},
+        {"type": "text", "text": "Règle: RGAA 1.1 — Pertinence du texte alternatif. Un objet JSON par bloc, dans l’ordre."}
     ]
     for i, b in enumerate(blocks, start=1):
-        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
+        user_items.append({"type": "text", "text": f"Bloc #{i}:"})
         if b.get("image_url"):
-            user_content.append({"type": "input_image", "image_url": b["image_url"]})
-        user_content.append({"type": "input_text", "text": f'ALT: "{b.get("alt","")}"'})
-        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
-    return [system, {"role": "user", "content": user_content}]
+            user_items.append(_image_item(b["image_url"]))
+        user_items.append({"type": "text", "text": f'ALT: "{b.get("alt","")}"'})
+        user_items.append({"type": "text", "text": f'Contexte voisin: "{b.get("context","")}"'})
+    return [system, {"role": "user", "content": user_items}]
 
 def build_msgs_ocr(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[str, Any]]:
     system = {
@@ -183,17 +199,17 @@ def build_msgs_ocr(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[st
             'Mets "Non pertinent" si du texte est présent dans l’image mais non restitué par alt/contenu adjacent.'
         )
     }
-    user_content: List[Dict[str, Any]] = [
-        {"type": "input_text", "text": f"Langue de la page: {page_lang or 'fr'}."},
-        {"type": "input_text", "text": "Règle: RGAA 1.5 — Texte dans l’image. Un objet JSON par bloc, dans l’ordre."}
+    user_items: List[Dict[str, Any]] = [
+        {"type": "text", "text": f"Langue de la page: {page_lang or 'fr'}."},
+        {"type": "text", "text": "Règle: RGAA 1.5 — Texte dans l’image. Un objet JSON par bloc, dans l’ordre."}
     ]
     for i, b in enumerate(blocks, start=1):
-        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
+        user_items.append({"type": "text", "text": f"Bloc #{i}:"})
         if b.get("image_url"):
-            user_content.append({"type": "input_image", "image_url": b["image_url"]})
-        user_content.append({"type": "input_text", "text": f'ALT fourni: "{b.get("alt","")}"'})
-        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
-    return [system, {"role": "user", "content": user_content}]
+            user_items.append(_image_item(b["image_url"]))
+        user_items.append({"type": "text", "text": f'ALT fourni: "{b.get("alt","")}"'})
+        user_items.append({"type": "text", "text": f'Contexte voisin: "{b.get("context","")}"'})
+    return [system, {"role": "user", "content": user_items}]
 
 def build_msgs_headings(screenshot_ref: Dict[str,str]) -> List[Dict[str, Any]]:
     system = {
@@ -205,18 +221,22 @@ def build_msgs_headings(screenshot_ref: Dict[str,str]) -> List[Dict[str, Any]]:
             "Déduis uniquement depuis la hiérarchie VISUELLE (taille/gras/position)."
         )
     }
-    content = []
+    user_items: List[Dict[str, Any]] = []
     if screenshot_ref.get("image_url"):
-        content.append({"type":"input_image","image_url":screenshot_ref["image_url"]})
+        user_items.append(_image_item(screenshot_ref["image_url"]))
     elif screenshot_ref.get("image_b64"):
-        content.append({"type":"input_image","image_url":f"data:image/png;base64,{screenshot_ref['image_b64']}"})
-    content.append({"type":"input_text","text":"Extrais les titres principaux visibles et attribue un niveau approximatif."})
-    return [system, {"role":"user","content": content}]
+        user_items.append(_image_item(screenshot_ref["image_b64"]))
+    user_items.append({"type":"text","text":"Extrais les titres principaux visibles et attribue un niveau approximatif."})
+    return [system, {"role":"user","content": user_items}]
 
 def build_msgs_link_yesno(link_text: str, href: str, context: str) -> List[Dict[str, Any]]:
     return [
         {"role":"system","content":"You are an accessibility expert. Answer ONLY one word: YES or NO."},
-        {"role":"user","content": f'Link text: "{link_text}"\nURL: "{href}"\nContext: "{context}"'}
+        {"role":"user","content":[
+            {"type":"text","text": f'Link text: "{link_text}"'},
+            {"type":"text","text": f'URL: "{href}"'},
+            {"type":"text","text": f'Context: "{context}"'}
+        ]}
     ]
 
 # =========================
@@ -257,7 +277,7 @@ def make_finding(
         "processed_by_ai": processed_by_ai,
         "ai_status": ai_status,          # "ok" | "skipped" | "error"
         "ai_error": ai_error,
-        "evidence": evidence             # {"model": "...", "mode":"vision|text"}
+        "evidence": evidence             # {"model": "...", "mode":"vision|text|rule"}
     }
     if extras:
         out.update(extras)
