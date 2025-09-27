@@ -8,9 +8,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
-# ==== Configuration Azure OpenAI (via variables d'environnement) ====
-AZ_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")  # ex: https://hackacton-ia4-impact2.openai.azure.com
-AZ_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT")  # ex: gpt-4.1-mini
+AZ_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZ_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 AZ_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
 API_VER     = "2025-01-01-preview"
 
