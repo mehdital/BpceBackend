@@ -1,5 +1,6 @@
-import os, json, re
-from urllib.parse import urljoin
+import os, json, re, base64
+from io import BytesIO
+from urllib.parse import urljoin, urlparse
 from typing import Dict, Any, List, Optional, Tuple
 
 import httpx
@@ -7,6 +8,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
+from PIL import Image
 
 # =========================
 # Azure OpenAI (Render env)
@@ -17,12 +19,20 @@ AZURE_OPENAI_API_KEY    = os.getenv("AZURE_OPENAI_API_KEY") or ""
 API_VER = "2025-01-01-preview"
 
 # =========================
+# Image constraints (sobriété)
+# =========================
+MAX_IMG_BYTES = 6 * 1024 * 1024   # 6 MB
+MAX_WIDTH     = 1600              # resize si > MAX_WIDTH
+TIMEOUT_HTML  = 20
+TIMEOUT_IMG   = 15
+
+# =========================
 # FastAPI
 # =========================
-app = FastAPI(title="IA Accessibility Auditor (Unified)", version="2.1.0")
+app = FastAPI(title="IA Accessibility Auditor (Unified+VisionProxy)", version="2.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # restreindre en prod
+    allow_origins=["*"],   # resserrer en prod
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
@@ -40,7 +50,7 @@ class Filters(BaseModel):
 class AuditRequest(BaseModel):
     url: HttpUrl
     filters: Filters
-    screenshot_url: Optional[str] = None           # image de la page (pour test visuel vs DOM)
+    screenshot_url: Optional[str] = None           # image de la page (test visuel vs DOM)
     screenshot_base64: Optional[str] = None        # "data:image/png;base64,..." ou base64 pur
 
 # =========================
@@ -51,7 +61,7 @@ async def fetch_html(url: str) -> str:
         "User-Agent": "IA4Impact/1.0 (+accessibility-audit)",
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=TIMEOUT_HTML) as client:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.text
@@ -150,19 +160,94 @@ async def call_azure_chat(messages: List[Dict[str, Any]], max_tokens: int = 500)
     return data["choices"][0]["message"]["content"]
 
 # =========================
-# Helpers contenu vision
+# Vision helpers (proxy/normalisation)
+# =========================
+def is_svg_url(url: str) -> bool:
+    return url.lower().endswith(".svg")
+
+def _referer_for(url: str) -> str:
+    # Meilleur referer par défaut = schéma + netloc
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else url
+
+async def fetch_image_bytes(url: str) -> bytes:
+    headers = {
+        "User-Agent": "IA4Impact/1.0 (+accessibility-audit)",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Referer": _referer_for(url)
+    }
+    async with httpx.AsyncClient(follow_redirects=True, timeout=TIMEOUT_IMG) as client:
+        r = await client.get(url, headers=headers)
+        r.raise_for_status()
+        data = r.content
+        if len(data) > MAX_IMG_BYTES:
+            raise HTTPException(400, f"Image too large ({len(data)} bytes)")
+        return data
+
+def pillow_open_safe(raw: bytes) -> Image.Image:
+    bio = BytesIO(raw)
+    img = Image.open(bio)
+    img.load()  # force decode
+    return img
+
+def normalize_image_to_png_dataurl(raw: bytes) -> str:
+    """
+    - GIF animé -> 1er frame
+    - Resize si > MAX_WIDTH
+    - Convertit en PNG (RGB/RGBA)
+    - Retourne data URL base64
+    """
+    img = pillow_open_safe(raw)
+
+    # GIF animé -> 1er frame
+    if getattr(img, "is_animated", False):
+        img.seek(0)
+        img = img.convert("RGBA")
+
+    # Resize sobriété
+    if img.width > MAX_WIDTH:
+        ratio = MAX_WIDTH / img.width
+        new_h = max(1, int(img.height * ratio))
+        img = img.resize((MAX_WIDTH, new_h), Image.LANCZOS)
+
+    # Uniformisation mode
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+
+    out = BytesIO()
+    img.save(out, format="PNG", optimize=True)
+    b64 = base64.b64encode(out.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+async def prepare_image_for_vision(src_url: str) -> dict:
+    """
+    Retour:
+      - {"ok": True, "data_url": "<data:image/png;base64,...>"}
+      - {"ok": False, "reason": "<motif>"}
+    """
+    if not src_url:
+        return {"ok": False, "reason": "empty_src"}
+    if is_svg_url(src_url):
+        return {"ok": False, "reason": "unsupported_format_svg"}
+    try:
+        raw = await fetch_image_bytes(src_url)
+        data_url = normalize_image_to_png_dataurl(raw)
+        return {"ok": True, "data_url": data_url}
+    except Exception as e:
+        return {"ok": False, "reason": f"fetch_or_decode_failed: {str(e)[:160]}"}
+
+# =========================
+# Helpers contenu vision (payload chat)
 # =========================
 def _image_item(url_or_b64: str) -> Dict[str, Any]:
     """
-    Construit un item 'image_url' conforme à l'API:
-    {"type":"image_url","image_url":{"url":"https://..."}}
-    Supporte aussi Data URL ou base64 pur.
+    Construit un item 'image_url' conforme:
+    {"type":"image_url","image_url":{"url":"https://...|data:image/..."}}
     """
     if url_or_b64.startswith("http"):
         return {"type": "image_url", "image_url": {"url": url_or_b64}}
     if url_or_b64.startswith("data:image/"):
         return {"type": "image_url", "image_url": {"url": url_or_b64}}
-    # Base64 pur -> Data URL PNG
     return {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{url_or_b64}"}}
 
 # =========================
@@ -336,68 +421,106 @@ async def audit(req: AuditRequest):
                 evidence={"model": None, "mode": "rule"}
             ))
 
-    # === B) ALT pertinence (IA vision)
+    # === B) ALT pertinence (IA vision) — via proxy PNG data URL
     if req.filters.IMG_ALT_PERTINENCE and candidates_alt:
-        blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_alt]
-        try:
-            raw = await call_azure_chat(build_msgs_alt(blocks, page_lang), max_tokens=400)
-            parsed = robust_json_parse(raw)
-            for im, res in zip(candidates_alt, parsed):
-                findings.append(make_finding(
-                    criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
-                    target={"src": im["src"], "selector": im["selector"]},
-                    judgment=res.get("judgment","Inconclusif"),
-                    explanation=res.get("explanation",""),
-                    suggestion=res.get("suggestion"),
-                    confidence=float(res.get("confidence",0.0)),
-                    processed_by_ai=True, ai_status="ok", ai_error=None,
-                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                ))
-            processing_report["alt_processed_ok"] = len(parsed)
-        except HTTPException as e:
-            processing_report["alt_errors"] = len(candidates_alt)
-            for im in candidates_alt:
-                findings.append(make_finding(
+        blocks = []
+        skip_findings = []
+        for im in candidates_alt:
+            prep = await prepare_image_for_vision(im["src"])
+            if prep.get("ok"):
+                blocks.append({"image_url": prep["data_url"], "alt": im["alt"], "context": im["context"], "_selector": im["selector"], "_src": im["src"]})
+            else:
+                skip_findings.append(make_finding(
                     criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
                     target={"src": im["src"], "selector": im["selector"]},
                     judgment="Inconclusif",
-                    explanation="Échec de l’évaluation IA du texte alternatif.",
+                    explanation="Image non analysée par vision.",
                     suggestion=None, confidence=0.0,
-                    processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
-                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
+                    processed_by_ai=True, ai_status="skipped", ai_error=prep.get("reason"),
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                    extras={"skip_reason": prep.get("reason")}
                 ))
+        findings.extend(skip_findings)
 
-    # === C) OCR texte dans l’image (IA vision)
+        if blocks:
+            try:
+                raw = await call_azure_chat(build_msgs_alt(blocks, page_lang), max_tokens=400)
+                parsed = robust_json_parse(raw)
+                for blk, res in zip(blocks, parsed):
+                    findings.append(make_finding(
+                        criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
+                        target={"src": blk["_src"], "selector": blk["_selector"]},
+                        judgment=res.get("judgment","Inconclusif"),
+                        explanation=res.get("explanation",""),
+                        suggestion=res.get("suggestion"),
+                        confidence=float(res.get("confidence",0.0)),
+                        processed_by_ai=True, ai_status="ok", ai_error=None,
+                        evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
+                    ))
+                processing_report["alt_processed_ok"] = len(parsed)
+            except HTTPException as e:
+                processing_report["alt_errors"] = len(blocks)
+                for blk in blocks:
+                    findings.append(make_finding(
+                        criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
+                        target={"src": blk["_src"], "selector": blk["_selector"]},
+                        judgment="Inconclusif",
+                        explanation="Échec de l’évaluation IA du texte alternatif.",
+                        suggestion=None, confidence=0.0,
+                        processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                        evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
+                    ))
+
+    # === C) OCR texte dans l’image (IA vision) — via proxy PNG data URL
     if req.filters.OCR_TEXT_IN_IMAGE and candidates_ocr:
-        blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_ocr]
-        try:
-            raw = await call_azure_chat(build_msgs_ocr(blocks, page_lang), max_tokens=500)
-            parsed = robust_json_parse(raw)
-            for im, res in zip(candidates_ocr, parsed):
-                findings.append(make_finding(
+        blocks = []
+        skip_findings = []
+        for im in candidates_ocr:
+            prep = await prepare_image_for_vision(im["src"])
+            if prep.get("ok"):
+                blocks.append({"image_url": prep["data_url"], "alt": im["alt"], "context": im["context"], "_selector": im["selector"], "_src": im["src"]})
+            else:
+                skip_findings.append(make_finding(
                     criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
                     target={"src": im["src"], "selector": im["selector"]},
-                    judgment=res.get("judgment","Inconclusif"),
-                    explanation=res.get("explanation",""),
-                    suggestion=res.get("suggestion"),
-                    confidence=float(res.get("confidence",0.0)),
-                    processed_by_ai=True, ai_status="ok", ai_error=None,
-                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
-                    extras={"detected_text": res.get("detected_text","")}
-                ))
-            processing_report["ocr_processed_ok"] = len(parsed)
-        except HTTPException as e:
-            processing_report["ocr_errors"] = len(candidates_ocr)
-            for im in candidates_ocr:
-                findings.append(make_finding(
-                    criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
-                    target={"src": im["src"], "selector": im["selector"]},
-                    judgment="Inconclusif", explanation="Échec de l’évaluation IA OCR.",
+                    judgment="Inconclusif",
+                    explanation="Image non analysée par vision.",
                     suggestion=None, confidence=0.0,
-                    processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                    processed_by_ai=True, ai_status="skipped", ai_error=prep.get("reason"),
                     evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
-                    extras={"detected_text": ""}
+                    extras={"skip_reason": prep.get("reason"), "detected_text": ""}
                 ))
+        findings.extend(skip_findings)
+
+        if blocks:
+            try:
+                raw = await call_azure_chat(build_msgs_ocr(blocks, page_lang), max_tokens=500)
+                parsed = robust_json_parse(raw)
+                for blk, res in zip(blocks, parsed):
+                    findings.append(make_finding(
+                        criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
+                        target={"src": blk["_src"], "selector": blk["_selector"]},
+                        judgment=res.get("judgment","Inconclusif"),
+                        explanation=res.get("explanation",""),
+                        suggestion=res.get("suggestion"),
+                        confidence=float(res.get("confidence",0.0)),
+                        processed_by_ai=True, ai_status="ok", ai_error=None,
+                        evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                        extras={"detected_text": res.get("detected_text","")}
+                    ))
+                processing_report["ocr_processed_ok"] = len(parsed)
+            except HTTPException as e:
+                processing_report["ocr_errors"] = len(blocks)
+                for blk in blocks:
+                    findings.append(make_finding(
+                        criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
+                        target={"src": blk["_src"], "selector": blk["_selector"]},
+                        judgment="Inconclusif", explanation="Échec de l’évaluation IA OCR.",
+                        suggestion=None, confidence=0.0,
+                        processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                        evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                        extras={"detected_text": ""}
+                    ))
 
     # === D) Headings visuels vs DOM (IA vision + DOM)
     if req.filters.HEADINGS_VISUAL_SEMANTICS:
@@ -543,7 +666,7 @@ async def audit(req: AuditRequest):
 # =========================
 @app.get("/")
 def health():
-    return {"status":"ok","service":"IA Accessibility Auditor (Unified)"}
+    return {"status":"ok","service":"IA Accessibility Auditor (Unified+VisionProxy)"}
 
 @app.head("/")
 def head_ok():
