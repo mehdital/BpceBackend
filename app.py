@@ -1,4 +1,4 @@
-import os, json, re, base64
+import os, json, re
 from urllib.parse import urljoin
 from typing import Dict, Any, List, Optional
 
@@ -9,37 +9,37 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 # =========================
-# Config Azure OpenAI (REST)
+# Azure OpenAI (Render env)
 # =========================
-AZ_ENDPOINT = (os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("ENDPOINT_URL") or "").rstrip("/")
-AZ_DEPLOY   = os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("DEPLOYMENT_NAME") or "gpt-4.1-mini"
-AZ_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
-API_VER     = "2025-01-01-preview"
+AZURE_OPENAI_ENDPOINT  = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT") or ""
+AZURE_OPENAI_API_KEY    = os.getenv("AZURE_OPENAI_API_KEY") or ""
+API_VER = "2025-01-01-preview"
 
 # =========================
-# Options runtime
+# Options (facultatif)
 # =========================
 ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "false").lower() == "true"
 
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="IA Accessibility Auditor", version="1.2.0")
+app = FastAPI(title="IA Accessibility Auditor", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restreindre en prod
+    allow_origins=["*"],        # resserrer en prod
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
 # =========================
-# Modèles d'entrée /audit
+# Modèles /audit
 # =========================
 class Filters(BaseModel):
     IMG_ALT_PERTINENCE: Optional[bool] = False
     OCR_TEXT_IN_IMAGE: Optional[bool] = False
-    HEADINGS_VISUAL_SEMANTICS: Optional[bool] = False  # nouveau
+    HEADINGS_VISUAL_SEMANTICS: Optional[bool] = False
 
 class AuditRequest(BaseModel):
     url: HttpUrl
@@ -47,16 +47,16 @@ class AuditRequest(BaseModel):
     screenshot_url: Optional[str] = None
     screenshot_base64: Optional[str] = None
 
-# -------------------------
+# =========================
 # Utilitaires généraux
-# -------------------------
+# =========================
 def absolutize(src: str, base: str) -> str:
     try:
         return urljoin(base, src)
     except Exception:
         return src
 
-async def fetch_html_httpx(url: str) -> str:
+async def fetch_html(url: str) -> str:
     headers = {
         "User-Agent": "IA4Impact/1.0 (+accessibility-audit)",
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -125,72 +125,6 @@ def robust_json_parse(raw: str):
             return json.loads(m.group(1))
         return []
 
-# -------------------------
-# Vision prompts / audit
-# -------------------------
-def build_vision_messages_alt(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    system = {
-        "role": "system",
-        "content": (
-            'Tu es un auditeur RGAA 4.1.2. '
-            'Réponds STRICTEMENT en JSON: '
-            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0}] '
-            'Valeurs: ["Pertinent","Non pertinent","Ambigu","Inconclusif"]. '
-            'Suggestion ≤ 120 caractères.'
-        )
-    }
-    user_content: List[Dict[str, Any]] = [
-        {"type": "input_text",
-         "text": "Règle: RGAA 1.1 — Pertinence du texte alternatif. Un objet JSON par bloc, dans l’ordre."}
-    ]
-    for i, b in enumerate(blocks, start=1):
-        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
-        if b.get("image_url"):
-            user_content.append({"type": "input_image", "image_url": b["image_url"]})
-        user_content.append({"type": "input_text", "text": f'ALT: "{b.get("alt","")}"'})
-        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
-    return [system, {"role": "user", "content": user_content}]
-
-def build_vision_messages_ocr(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    system = {
-        "role": "system",
-        "content": (
-            'Auditeur RGAA 4.1.2 (OCR). '
-            'Réponds STRICTEMENT en JSON: '
-            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0,"detected_text":"..."}] '
-            'Mets "Non pertinent" si du texte est présent dans l’image mais non restitué.'
-        )
-    }
-    user_content: List[Dict[str, Any]] = [
-        {"type": "input_text",
-         "text": "Règle: RGAA 1.5 — Texte présent dans l’image. Un objet JSON par bloc, dans l’ordre."}
-    ]
-    for i, b in enumerate(blocks, start=1):
-        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
-        if b.get("image_url"):
-            user_content.append({"type": "input_image", "image_url": b["image_url"]})
-        user_content.append({"type": "input_text", "text": f'ALT fourni: "{b.get("alt","")}"'})
-        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
-    return [system, {"role": "user", "content": user_content}]
-
-def build_vision_messages_headings(screenshot_ref: Dict[str,str]) -> List[Dict[str, Any]]:
-    system = {
-        "role": "system",
-        "content": (
-            "Tu es auditeur RGAA 4.1.2 (structuration). "
-            "Réponds STRICTEMENT en JSON: "
-            '{"visual_outline":[{"level":"H1|H2|H3|H4|H5|H6","text":"..."}]} '
-            "Déduis uniquement depuis la hiérarchie VISUELLE (taille/gras/position)."
-        )
-    }
-    content = []
-    if screenshot_ref.get("image_url"):
-        content.append({"type":"input_image","image_url":screenshot_ref["image_url"]})
-    elif screenshot_ref.get("image_b64"):
-        content.append({"type":"input_image","image_base64":screenshot_ref["image_b64"]})
-    content.append({"type":"input_text","text":"Extrais les titres principaux visibles et attribue un niveau approximatif."})
-    return [system, {"role":"user","content": content}]
-
 def compare_visual_vs_dom(visual: List[Dict[str,str]], dom: List[Dict[str,str]]) -> (str, str):
     if visual and not dom:
         return "Non conforme", "Structure visuelle détectée sans titres sémantiques H1–H6 dans le DOM."
@@ -212,31 +146,94 @@ def compare_visual_vs_dom(visual: List[Dict[str,str]], dom: List[Dict[str,str]])
         return "Ambigu", f"Correspondance partielle (≈{int(ratio*100)}%)."
     return "Non conforme", f"Correspondance insuffisante (≈{int(ratio*100)}%)."
 
-# -------------------------
-# Appel Azure (REST)
-# -------------------------
-async def call_azure_chat_vision(messages: List[Dict[str, Any]]) -> str:
-    if not (AZ_ENDPOINT and AZ_DEPLOY and AZ_API_KEY):
+# =========================
+# Azure OpenAI (REST call)
+# =========================
+def ensure_azure_config():
+    if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT and AZURE_OPENAI_API_KEY):
         raise HTTPException(500, "Azure OpenAI non configuré (AZURE_OPENAI_ENDPOINT/_DEPLOYMENT/_API_KEY).")
-    url = f"{AZ_ENDPOINT}/openai/deployments/{AZ_DEPLOY}/chat/completions?api-version={API_VER}"
-    payload = {"model": AZ_DEPLOY, "temperature": 0.2, "messages": messages}
+
+async def call_azure_chat(messages: List[Dict[str, Any]]) -> str:
+    ensure_azure_config()
+    url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VER}"
+    payload = {"model": AZURE_OPENAI_DEPLOYMENT, "temperature": 0.2, "messages": messages}
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers={"api-key": AZ_API_KEY, "Content-Type": "application/json"}, json=payload)
+        r = await client.post(url, headers={"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"}, json=payload)
         if r.status_code >= 400:
             raise HTTPException(status_code=r.status_code, detail=r.text)
         data = r.json()
     return data["choices"][0]["message"]["content"]
 
-# ============================================================
-# Endpoint principal /audit (images ALT, OCR, structure visuelle)
-# ============================================================
+# =========================
+# Prompts Vision
+# =========================
+def build_msgs_alt(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    system = {
+        "role": "system",
+        "content": (
+            'Tu es un auditeur RGAA 4.1.2. '
+            'Réponds STRICTEMENT en JSON: '
+            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0}] '
+            'Valeurs: ["Pertinent","Non pertinent","Ambigu","Inconclusif"]. Suggestion ≤ 120 caractères.'
+        )
+    }
+    user_content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": "Règle: RGAA 1.1 — Pertinence du texte alternatif. Un objet JSON par bloc, dans l’ordre."}
+    ]
+    for i, b in enumerate(blocks, start=1):
+        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
+        if b.get("image_url"):
+            user_content.append({"type": "input_image", "image_url": b["image_url"]})
+        user_content.append({"type": "input_text", "text": f'ALT: "{b.get("alt","")}"'})
+        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
+    return [system, {"role": "user", "content": user_content}]
+
+def build_msgs_ocr(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+    system = {
+        "role": "system",
+        "content": (
+            'Auditeur RGAA 4.1.2 (OCR). '
+            'Réponds STRICTEMENT en JSON: '
+            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0,"detected_text":"..."}] '
+            'Mets "Non pertinent" si du texte est présent dans l’image mais non restitué.'
+        )
+    }
+    user_content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": "Règle: RGAA 1.5 — Texte présent dans l’image. Un objet JSON par bloc, dans l’ordre."}
+    ]
+    for i, b in enumerate(blocks, start=1):
+        user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
+        if b.get("image_url"):
+            user_content.append({"type": "input_image", "image_url": b["image_url"]})
+        user_content.append({"type": "input_text", "text": f'ALT fourni: "{b.get("alt","")}"'})
+        user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
+    return [system, {"role": "user", "content": user_content}]
+
+def build_msgs_headings(screenshot_ref: Dict[str,str]) -> List[Dict[str, Any]]:
+    system = {
+        "role": "system",
+        "content": (
+            "Tu es auditeur RGAA 4.1.2 (structuration). "
+            'Réponds STRICTEMENT en JSON: {"visual_outline":[{"level":"H1|H2|H3|H4|H5|H6","text":"..."}]} '
+            "Déduis uniquement depuis la hiérarchie VISUELLE."
+        )
+    }
+    content = []
+    if screenshot_ref.get("image_url"):
+        content.append({"type":"input_image","image_url":screenshot_ref["image_url"]})
+    elif screenshot_ref.get("image_b64"):
+        content.append({"type":"input_image","image_base64":screenshot_ref["image_b64"]})
+    content.append({"type":"input_text","text":"Extrais les titres principaux visibles et attribue un niveau approximatif."})
+    return [system, {"role":"user","content": content}]
+
+# =========================
+# Endpoint /audit
+# =========================
 @app.post("/audit")
 async def audit(req: AuditRequest):
-    # 1) HTML (HTTP simple)
-    html = await fetch_html_httpx(str(req.url))
+    html = await fetch_html(str(req.url))
     images = extract_images(html, str(req.url))
 
-    # 2) Sélections
     candidates_alt, candidates_ocr, missing_alt = [], [], []
     for im in images:
         if im["aria_hidden"]:
@@ -262,7 +259,7 @@ async def audit(req: AuditRequest):
         "ocr_errors": 0
     }
 
-    # 3) Absence d’alt (règle immédiate)
+    # Absence d'alt (règle)
     for im in missing_alt:
         findings.append({
             "criterion": "IMG_ALT_PERTINENCE",
@@ -278,11 +275,11 @@ async def audit(req: AuditRequest):
             "evidence": {"model": None, "mode": "rule"}
         })
 
-    # 4) ALT pertinence (IA)
+    # ALT pertinence (IA)
     if candidates_alt:
         blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_alt]
         try:
-            raw = await call_azure_chat_vision(build_vision_messages_alt(blocks))
+            raw = await call_azure_chat(build_msgs_alt(blocks))
             parsed = robust_json_parse(raw)
             for im, res in zip(candidates_alt, parsed):
                 findings.append({
@@ -296,7 +293,7 @@ async def audit(req: AuditRequest):
                     "processed_by_ai": True,
                     "ai_status": "ok",
                     "ai_error": None,
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
             processing_report["alt_processed_ok"] = len(parsed)
         except HTTPException as e:
@@ -313,14 +310,14 @@ async def audit(req: AuditRequest):
                     "processed_by_ai": True,
                     "ai_status": "error",
                     "ai_error": str(e.detail)[:500],
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
 
-    # 5) OCR / texte dans l’image (IA)
+    # OCR texte dans l’image (IA)
     if candidates_ocr:
         blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_ocr]
         try:
-            raw = await call_azure_chat_vision(build_vision_messages_ocr(blocks))
+            raw = await call_azure_chat(build_msgs_ocr(blocks))
             parsed = robust_json_parse(raw)
             for im, res in zip(candidates_ocr, parsed):
                 findings.append({
@@ -335,7 +332,7 @@ async def audit(req: AuditRequest):
                     "processed_by_ai": True,
                     "ai_status": "ok",
                     "ai_error": None,
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
             processing_report["ocr_processed_ok"] = len(parsed)
         except HTTPException as e:
@@ -353,19 +350,19 @@ async def audit(req: AuditRequest):
                     "processed_by_ai": True,
                     "ai_status": "error",
                     "ai_error": str(e.detail)[:500],
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
 
-    # 6) Structure visuelle vs DOM (screenshot)
+    # Structure visuelle vs DOM
     if req.filters.HEADINGS_VISUAL_SEMANTICS:
         dom_outline = extract_dom_outline(html)
-        # Prépare la référence image
         screenshot_ref = {}
         if req.screenshot_url:
             screenshot_ref = {"image_url": req.screenshot_url}
         elif req.screenshot_base64:
             b64 = req.screenshot_base64.split(",",1)[1] if "," in req.screenshot_base64 else req.screenshot_base64
             screenshot_ref = {"image_b64": b64}
+
         if not screenshot_ref:
             findings.append({
                 "criterion": "HEADINGS_VISUAL_SEMANTICS",
@@ -384,7 +381,7 @@ async def audit(req: AuditRequest):
             })
         else:
             try:
-                raw = await call_azure_chat_vision(build_vision_messages_headings(screenshot_ref))
+                raw = await call_azure_chat(build_msgs_headings(screenshot_ref))
                 parsed = robust_json_parse(raw)  # dict attendu
                 visual_outline = parsed.get("visual_outline", []) if isinstance(parsed, dict) else []
                 judgment, explanation = compare_visual_vs_dom(visual_outline, dom_outline)
@@ -401,7 +398,7 @@ async def audit(req: AuditRequest):
                     "ai_error": None,
                     "visual_outline": visual_outline,
                     "dom_outline": dom_outline,
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
             except HTTPException as e:
                 findings.append({
@@ -417,7 +414,7 @@ async def audit(req: AuditRequest):
                     "ai_error": str(e.detail)[:500],
                     "visual_outline": [],
                     "dom_outline": dom_outline,
-                    "evidence": {"model": AZ_DEPLOY, "mode": "vision"}
+                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
                 })
 
     return {
@@ -425,7 +422,7 @@ async def audit(req: AuditRequest):
         "summary": {
             "counts": {
                 "images_total": len(images),
-                "images_alt_missing": len([i for i in missing_alt]),
+                "images_alt_missing": len(missing_alt),
                 "images_alt_tested": len(candidates_alt),
                 "images_ocr_tested": len(candidates_ocr),
                 "findings": len(findings)
@@ -434,45 +431,23 @@ async def audit(req: AuditRequest):
             "notes": [
                 "RGAA 1.1: présence (règle) + pertinence (IA).",
                 "RGAA 1.5: texte dans l’image (IA).",
-                "RGAA 9.1/9.2: hiérarchie visuelle vs structure DOM (screenshot)."
+                "RGAA 9.1/9.2: hiérarchie visuelle vs structure DOM."
             ]
         },
         "findings": findings,
         "metadata": {
-            "models": [AZ_DEPLOY],
+            "models": [AZURE_OPENAI_DEPLOYMENT] if (candidates_alt or candidates_ocr or req.filters.HEADINGS_VISUAL_SEMANTICS) else [],
             "filters": [k for k,v in req.filters.model_dump().items() if v]
         }
     }
 
-# ============================================================
-# Nouveau endpoint /check-links-ai (portage de votre Flask)
-# ============================================================
-def selenium_render(url: str) -> Optional[str]:
-    """Rendu JS optionnel. Requiert ENABLE_SELENIUM=true et deps installées."""
-    if not ENABLE_SELENIUM:
-        return None
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-        from selenium.webdriver.chrome.service import Service
-        from webdriver_manager.chrome import ChromeDriverManager
-
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-
-        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-        driver.get(url)
-        html = driver.page_source
-        driver.quit()
-        return html
-    except Exception as e:
-        print(f"[Selenium] {e}")
-        return None
-
+# =========================
+# Endpoint /check-links-ai
+# =========================
 async def azure_yes_no_link_explicit(link_text: str, href: str, context_text: str) -> str:
+    # Dégradation propre si non configuré
+    if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT and AZURE_OPENAI_API_KEY):
+        return "SKIPPED"
     prompt = (
         "You are an accessibility expert.\n"
         f'Link text: "{link_text}"\n'
@@ -481,23 +456,20 @@ async def azure_yes_no_link_explicit(link_text: str, href: str, context_text: st
         'Answer exactly "YES" or "NO": does this link text clearly convey the destination or action?'
     )
     messages = [{"role": "system", "content": prompt}]
-    raw = await call_azure_chat_vision(messages)  # même endpoint chat/completions
+    raw = await call_azure_chat(messages)
     return (raw or "").strip().split()[0].upper()
 
 @app.get("/check-links-ai")
 async def check_links_ai(url: str = Query(..., description="URL à auditer")):
-    # 1) Reachability simple
+    # Reachability
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             await client.head(url, follow_redirects=True)
     except Exception as e:
         raise HTTPException(400, f"URL not reachable: {e}")
 
-    # 2) HTML: tente Selenium si activé, sinon HTTP simple
-    html = selenium_render(url) or await fetch_html_httpx(url)
-    if not html:
-        raise HTTPException(500, "No content retrieved from page")
-
+    # HTML
+    html = await fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
     results = []
@@ -539,7 +511,7 @@ async def check_links_ai(url: str = Query(..., description="URL à auditer")):
             "issues": []
         }
 
-        # Texte de lien vide
+        # Texte vide
         if not link_info["text"]:
             link_info["issues"].append("Empty link text")
 
@@ -551,7 +523,7 @@ async def check_links_ai(url: str = Query(..., description="URL à auditer")):
             if not any(alt_texts):
                 link_info["issues"].append("Link contains only image(s) without alt text")
 
-        # Duplicat libellé → destinations différentes
+        # Duplicats
         text_key = (link_info["text"] or "").strip().lower()
         if text_key:
             if text_key in seen_texts:
@@ -560,32 +532,29 @@ async def check_links_ai(url: str = Query(..., description="URL à auditer")):
             else:
                 seen_texts[text_key] = link_info["href"]
 
-        # IA: explicitation du libellé
+        # IA YES/NO
         parent_text = a.find_parent().get_text(" ", strip=True) if a.find_parent() else ""
         if link_info["text"]:
-            try:
-                ai_answer = await azure_yes_no_link_explicit(link_info["text"], link_info["href"], parent_text[:1000])
-                link_info["ai_explicit"] = ai_answer
-                if ai_answer == "NO":
-                    link_info["issues"].append("Link text not explicit according to AI check")
-            except HTTPException as e:
-                link_info["ai_explicit"] = "ERROR"
-                link_info["issues"].append(f"AI check failed: {str(e.detail)[:200]}")
+            ai_answer = await azure_yes_no_link_explicit(link_info["text"], link_info["href"], parent_text[:1000])
+            link_info["ai_explicit"] = ai_answer
+            if ai_answer == "NO":
+                link_info["issues"].append("Link text not explicit according to AI check")
+            if ai_answer == "SKIPPED":
+                link_info["issues"].append("AI check skipped (not configured)")
 
         results.append(link_info)
 
     return {
         "url": url,
         "links_report": results,
-        "stats": {
-            "total_links": len(links),
-            "items_reported": len(results)
-        }
+        "stats": {"total_links": len(links), "items_reported": len(results)}
     }
 
+# =========================
 # Health
+# =========================
 @app.get("/")
-def root():
+def health():
     return {"status": "ok", "service": "IA Accessibility Auditor"}
 
 @app.head("/")
