@@ -1,61 +1,51 @@
 import os, json, re
 from urllib.parse import urljoin
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import httpx
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 # =========================
 # Azure OpenAI (Render env)
 # =========================
-AZURE_OPENAI_ENDPOINT  = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
+AZURE_OPENAI_ENDPOINT   = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT") or ""
 AZURE_OPENAI_API_KEY    = os.getenv("AZURE_OPENAI_API_KEY") or ""
 API_VER = "2025-01-01-preview"
 
 # =========================
-# Options (facultatif)
-# =========================
-ENABLE_SELENIUM = os.getenv("ENABLE_SELENIUM", "false").lower() == "true"
-
-# =========================
 # FastAPI
 # =========================
-app = FastAPI(title="IA Accessibility Auditor", version="1.3.0")
+app = FastAPI(title="IA Accessibility Auditor (Unified)", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # resserrer en prod
+    allow_origins=["*"],   # restreindre en prod
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
 # =========================
-# Modèles /audit
+# Entrées /audit
 # =========================
 class Filters(BaseModel):
     IMG_ALT_PERTINENCE: Optional[bool] = False
     OCR_TEXT_IN_IMAGE: Optional[bool] = False
     HEADINGS_VISUAL_SEMANTICS: Optional[bool] = False
+    LINK_LABEL_PERTINENCE: Optional[bool] = False
 
 class AuditRequest(BaseModel):
     url: HttpUrl
     filters: Filters
-    screenshot_url: Optional[str] = None
-    screenshot_base64: Optional[str] = None
+    screenshot_url: Optional[str] = None           # image de la page (facilite le test "visuel vs DOM")
+    screenshot_base64: Optional[str] = None        # "data:image/png;base64,..." ou base64 pur
 
 # =========================
-# Utilitaires généraux
+# Utilitaires HTML/DOM
 # =========================
-def absolutize(src: str, base: str) -> str:
-    try:
-        return urljoin(base, src)
-    except Exception:
-        return src
-
 async def fetch_html(url: str) -> str:
     headers = {
         "User-Agent": "IA4Impact/1.0 (+accessibility-audit)",
@@ -65,6 +55,17 @@ async def fetch_html(url: str) -> str:
         r = await client.get(url, headers=headers)
         r.raise_for_status()
         return r.text
+
+def absolutize(src: str, base: str) -> str:
+    try:
+        return urljoin(base, src)
+    except Exception:
+        return src
+
+def get_page_lang(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("html")
+    return (tag.get("lang") or "").strip() if tag else ""
 
 def extract_images(html: str, base_url: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -125,38 +126,22 @@ def robust_json_parse(raw: str):
             return json.loads(m.group(1))
         return []
 
-def compare_visual_vs_dom(visual: List[Dict[str,str]], dom: List[Dict[str,str]]) -> (str, str):
-    if visual and not dom:
-        return "Non conforme", "Structure visuelle détectée sans titres sémantiques H1–H6 dans le DOM."
-    if not visual:
-        return "Inconclusif", "Aucun titre saillant détecté visuellement (capture)."
-
-    def norm(s): return re.sub(r"\s+", " ", (s or "").strip().lower())
-    dom_texts = [norm(d["text"]) for d in dom]
-    hits = 0
-    for v in visual:
-        vt = norm(v["text"])
-        matched = any(vt and (vt in dt or dt in vt) for dt in dom_texts)
-        if matched:
-            hits += 1
-    ratio = hits / max(1, len(visual))
-    if ratio >= 0.7:
-        return "Conforme", f"≈{int(ratio*100)}% des titres visuels correspondent aux titres DOM."
-    if ratio >= 0.3:
-        return "Ambigu", f"Correspondance partielle (≈{int(ratio*100)}%)."
-    return "Non conforme", f"Correspondance insuffisante (≈{int(ratio*100)}%)."
-
 # =========================
-# Azure OpenAI (REST call)
+# Azure OpenAI
 # =========================
 def ensure_azure_config():
     if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT and AZURE_OPENAI_API_KEY):
         raise HTTPException(500, "Azure OpenAI non configuré (AZURE_OPENAI_ENDPOINT/_DEPLOYMENT/_API_KEY).")
 
-async def call_azure_chat(messages: List[Dict[str, Any]]) -> str:
+async def call_azure_chat(messages: List[Dict[str, Any]], max_tokens: int = 500) -> str:
     ensure_azure_config()
     url = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version={API_VER}"
-    payload = {"model": AZURE_OPENAI_DEPLOYMENT, "temperature": 0.2, "messages": messages}
+    payload = {
+        "model": AZURE_OPENAI_DEPLOYMENT,
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+        "messages": messages
+    }
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(url, headers={"api-key": AZURE_OPENAI_API_KEY, "Content-Type": "application/json"}, json=payload)
         if r.status_code >= 400:
@@ -167,17 +152,17 @@ async def call_azure_chat(messages: List[Dict[str, Any]]) -> str:
 # =========================
 # Prompts Vision
 # =========================
-def build_msgs_alt(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def build_msgs_alt(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[str, Any]]:
     system = {
         "role": "system",
         "content": (
-            'Tu es un auditeur RGAA 4.1.2. '
-            'Réponds STRICTEMENT en JSON: '
-            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0}] '
-            'Valeurs: ["Pertinent","Non pertinent","Ambigu","Inconclusif"]. Suggestion ≤ 120 caractères.'
+            "Tu es auditeur RGAA 4.1.2.\n"
+            "Ne retourne jamais de texte hors JSON. Si tu hésites, renvoie un JSON valide avec 'judgment':'Inconclusif'.\n"
+            'Format: [{"judgment":"Pertinent|Non pertinent|Ambigu|Inconclusif","explanation":"...","suggestion":"...","confidence":0.0}]'
         )
     }
     user_content: List[Dict[str, Any]] = [
+        {"type": "input_text", "text": f"Langue de la page: {page_lang or 'fr'}."},
         {"type": "input_text", "text": "Règle: RGAA 1.1 — Pertinence du texte alternatif. Un objet JSON par bloc, dans l’ordre."}
     ]
     for i, b in enumerate(blocks, start=1):
@@ -188,18 +173,19 @@ def build_msgs_alt(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         user_content.append({"type": "input_text", "text": f'Contexte voisin: "{b.get("context","")}"'})
     return [system, {"role": "user", "content": user_content}]
 
-def build_msgs_ocr(blocks: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+def build_msgs_ocr(blocks: List[Dict[str, str]], page_lang: str) -> List[Dict[str, Any]]:
     system = {
         "role": "system",
         "content": (
-            'Auditeur RGAA 4.1.2 (OCR). '
-            'Réponds STRICTEMENT en JSON: '
-            '[{"judgment":"...","explanation":"...","suggestion":"...","confidence":0.0,"detected_text":"..."}] '
-            'Mets "Non pertinent" si du texte est présent dans l’image mais non restitué.'
+            "Auditeur RGAA 4.1.2 (OCR).\n"
+            "Ne retourne jamais de texte hors JSON. Si tu hésites, renvoie un JSON valide avec 'judgment':'Inconclusif'.\n"
+            'Format: [{"judgment":"Pertinent|Non pertinent|Ambigu|Inconclusif","explanation":"...","suggestion":"...","confidence":0.0,"detected_text":"..."}]\n'
+            'Mets "Non pertinent" si du texte est présent dans l’image mais non restitué par alt/contenu adjacent.'
         )
     }
     user_content: List[Dict[str, Any]] = [
-        {"type": "input_text", "text": "Règle: RGAA 1.5 — Texte présent dans l’image. Un objet JSON par bloc, dans l’ordre."}
+        {"type": "input_text", "text": f"Langue de la page: {page_lang or 'fr'}."},
+        {"type": "input_text", "text": "Règle: RGAA 1.5 — Texte dans l’image. Un objet JSON par bloc, dans l’ordre."}
     ]
     for i, b in enumerate(blocks, start=1):
         user_content.append({"type": "input_text", "text": f"Bloc #{i}:"})
@@ -213,41 +199,94 @@ def build_msgs_headings(screenshot_ref: Dict[str,str]) -> List[Dict[str, Any]]:
     system = {
         "role": "system",
         "content": (
-            "Tu es auditeur RGAA 4.1.2 (structuration). "
-            'Réponds STRICTEMENT en JSON: {"visual_outline":[{"level":"H1|H2|H3|H4|H5|H6","text":"..."}]} '
-            "Déduis uniquement depuis la hiérarchie VISUELLE."
+            "Tu es auditeur RGAA 4.1.2 (structuration).\n"
+            "Ne retourne jamais de texte hors JSON.\n"
+            'Format: {"visual_outline":[{"level":"H1|H2|H3|H4|H5|H6","text":"..."}]} '
+            "Déduis uniquement depuis la hiérarchie VISUELLE (taille/gras/position)."
         )
     }
     content = []
     if screenshot_ref.get("image_url"):
         content.append({"type":"input_image","image_url":screenshot_ref["image_url"]})
     elif screenshot_ref.get("image_b64"):
-        content.append({"type":"input_image","image_base64":screenshot_ref["image_b64"]})
+        content.append({"type":"input_image","image_url":f"data:image/png;base64,{screenshot_ref['image_b64']}"})
     content.append({"type":"input_text","text":"Extrais les titres principaux visibles et attribue un niveau approximatif."})
     return [system, {"role":"user","content": content}]
 
+def build_msgs_link_yesno(link_text: str, href: str, context: str) -> List[Dict[str, Any]]:
+    return [
+        {"role":"system","content":"You are an accessibility expert. Answer ONLY one word: YES or NO."},
+        {"role":"user","content": f'Link text: "{link_text}"\nURL: "{href}"\nContext: "{context}"'}
+    ]
+
 # =========================
-# Endpoint /audit
+# Aides évaluation
+# =========================
+def compare_visual_vs_dom(visual: List[Dict[str,str]], dom: List[Dict[str,str]]) -> Tuple[str, str]:
+    if visual and not dom:
+        return "Non conforme", "Structure visuelle détectée sans titres sémantiques H1–H6 dans le DOM."
+    if not visual:
+        return "Inconclusif", "Aucun titre saillant détecté visuellement (capture)."
+    def norm(s): return re.sub(r"\s+", " ", (s or "").strip().lower())
+    dom_texts = [norm(d["text"]) for d in dom]
+    hits = 0
+    for v in visual:
+        vt = norm(v["text"])
+        matched = any(vt and (vt in dt or dt in vt) for dt in dom_texts)
+        if matched:
+            hits += 1
+    ratio = hits / max(1, len(visual))
+    if ratio >= 0.7:  return "Conforme", f"≈{int(ratio*100)}% des titres visuels correspondent aux titres DOM."
+    if ratio >= 0.3:  return "Ambigu",   f"Correspondance partielle (≈{int(ratio*100)}%)."
+    return "Non conforme", f"Correspondance insuffisante (≈{int(ratio*100)}%)."
+
+def make_finding(
+    *, criterion: str, rgaa: str, target: Dict[str, Any],
+    judgment: str, explanation: str, suggestion: Optional[str],
+    confidence: float, processed_by_ai: bool, ai_status: str, ai_error: Optional[str],
+    evidence: Dict[str, Any], extras: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    out = {
+        "criterion": criterion,
+        "rgaa": rgaa,
+        "target": target,
+        "judgment": judgment,
+        "explanation": explanation,
+        "suggestion": suggestion,
+        "confidence": confidence,
+        "processed_by_ai": processed_by_ai,
+        "ai_status": ai_status,          # "ok" | "skipped" | "error"
+        "ai_error": ai_error,
+        "evidence": evidence             # {"model": "...", "mode":"vision|text"}
+    }
+    if extras:
+        out.update(extras)
+    return out
+
+# =========================
+# Endpoint unique /audit
 # =========================
 @app.post("/audit")
 async def audit(req: AuditRequest):
     html = await fetch_html(str(req.url))
+    page_lang = get_page_lang(html) or "fr"
     images = extract_images(html, str(req.url))
 
+    # Sélections images (sobriété V1)
     candidates_alt, candidates_ocr, missing_alt = [], [], []
-    for im in images:
-        if im["aria_hidden"]:
-            continue
-        if req.filters.IMG_ALT_PERTINENCE and im["alt"] == "":
-            missing_alt.append(im)
-        if req.filters.IMG_ALT_PERTINENCE and im["alt"]:
-            candidates_alt.append(im)
-        if req.filters.OCR_TEXT_IN_IMAGE:
-            candidates_ocr.append(im)
-
-    candidates_alt = candidates_alt[:10]
-    candidates_ocr = candidates_ocr[:10]
-    missing_alt    = missing_alt   [:50]
+    if req.filters.IMG_ALT_PERTINENCE or req.filters.OCR_TEXT_IN_IMAGE:
+        for im in images:
+            if im["aria_hidden"]:
+                continue
+            if req.filters.IMG_ALT_PERTINENCE and im["alt"] == "":
+                missing_alt.append(im)
+            if req.filters.IMG_ALT_PERTINENCE and im["alt"]:
+                candidates_alt.append(im)
+            if req.filters.OCR_TEXT_IN_IMAGE:
+                candidates_ocr.append(im)
+        candidates_alt = candidates_alt[:10]
+        candidates_ocr = candidates_ocr[:10]
+        missing_alt    = missing_alt   [:50]
 
     findings: List[Dict[str, Any]] = []
     processing_report = {
@@ -256,104 +295,91 @@ async def audit(req: AuditRequest):
         "alt_processed_ok": 0,
         "ocr_processed_ok": 0,
         "alt_errors": 0,
-        "ocr_errors": 0
+        "ocr_errors": 0,
+        "links_checked": 0,
+        "links_ai_skipped": 0,
+        "links_ai_errors": 0,
+        "headings_processed": False,
+        "headings_error": False
     }
 
-    # Absence d'alt (règle)
-    for im in missing_alt:
-        findings.append({
-            "criterion": "IMG_ALT_PERTINENCE",
-            "rgaa": "1.1",
-            "target": {"src": im["src"], "selector": im["selector"]},
-            "judgment": "Non conforme",
-            "explanation": "Image potentiellement informative sans attribut alt.",
-            "suggestion": "Ajouter un alt descriptif concis adapté au contexte.",
-            "confidence": 1.0,
-            "processed_by_ai": False,
-            "ai_status": "skipped",
-            "ai_error": None,
-            "evidence": {"model": None, "mode": "rule"}
-        })
+    # === A) IMG sans alt (règle — pas d’IA)
+    if req.filters.IMG_ALT_PERTINENCE:
+        for im in missing_alt:
+            findings.append(make_finding(
+                criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
+                target={"src": im["src"], "selector": im["selector"]},
+                judgment="Non conforme",
+                explanation="Image potentiellement informative sans attribut alt.",
+                suggestion="Ajouter un alt descriptif concis adapté au contexte.",
+                confidence=1.0, processed_by_ai=False, ai_status="skipped", ai_error=None,
+                evidence={"model": None, "mode": "rule"}
+            ))
 
-    # ALT pertinence (IA)
-    if candidates_alt:
+    # === B) ALT pertinence (IA vision)
+    if req.filters.IMG_ALT_PERTINENCE and candidates_alt:
         blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_alt]
         try:
-            raw = await call_azure_chat(build_msgs_alt(blocks))
+            raw = await call_azure_chat(build_msgs_alt(blocks, page_lang), max_tokens=400)
             parsed = robust_json_parse(raw)
             for im, res in zip(candidates_alt, parsed):
-                findings.append({
-                    "criterion": "IMG_ALT_PERTINENCE",
-                    "rgaa": "1.1",
-                    "target": {"src": im["src"], "selector": im["selector"]},
-                    "judgment": res.get("judgment","Inconclusif"),
-                    "explanation": res.get("explanation",""),
-                    "suggestion": res.get("suggestion"),
-                    "confidence": float(res.get("confidence",0.0)),
-                    "processed_by_ai": True,
-                    "ai_status": "ok",
-                    "ai_error": None,
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
+                    target={"src": im["src"], "selector": im["selector"]},
+                    judgment=res.get("judgment","Inconclusif"),
+                    explanation=res.get("explanation",""),
+                    suggestion=res.get("suggestion"),
+                    confidence=float(res.get("confidence",0.0)),
+                    processed_by_ai=True, ai_status="ok", ai_error=None,
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
+                ))
             processing_report["alt_processed_ok"] = len(parsed)
         except HTTPException as e:
             processing_report["alt_errors"] = len(candidates_alt)
             for im in candidates_alt:
-                findings.append({
-                    "criterion": "IMG_ALT_PERTINENCE",
-                    "rgaa": "1.1",
-                    "target": {"src": im["src"], "selector": im["selector"]},
-                    "judgment": "Inconclusif",
-                    "explanation": "Échec de l’évaluation IA du texte alternatif.",
-                    "suggestion": None,
-                    "confidence": 0.0,
-                    "processed_by_ai": True,
-                    "ai_status": "error",
-                    "ai_error": str(e.detail)[:500],
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="IMG_ALT_PERTINENCE", rgaa="1.1",
+                    target={"src": im["src"], "selector": im["selector"]},
+                    judgment="Inconclusif",
+                    explanation="Échec de l’évaluation IA du texte alternatif.",
+                    suggestion=None, confidence=0.0,
+                    processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
+                ))
 
-    # OCR texte dans l’image (IA)
-    if candidates_ocr:
+    # === C) OCR texte dans l’image (IA vision)
+    if req.filters.OCR_TEXT_IN_IMAGE and candidates_ocr:
         blocks = [{"image_url": im["src"], "alt": im["alt"], "context": im["context"]} for im in candidates_ocr]
         try:
-            raw = await call_azure_chat(build_msgs_ocr(blocks))
+            raw = await call_azure_chat(build_msgs_ocr(blocks, page_lang), max_tokens=500)
             parsed = robust_json_parse(raw)
             for im, res in zip(candidates_ocr, parsed):
-                findings.append({
-                    "criterion": "OCR_TEXT_IN_IMAGE",
-                    "rgaa": "1.5",
-                    "target": {"src": im["src"], "selector": im["selector"]},
-                    "judgment": res.get("judgment","Inconclusif"),
-                    "explanation": res.get("explanation",""),
-                    "suggestion": res.get("suggestion"),
-                    "confidence": float(res.get("confidence",0.0)),
-                    "detected_text": res.get("detected_text",""),
-                    "processed_by_ai": True,
-                    "ai_status": "ok",
-                    "ai_error": None,
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
+                    target={"src": im["src"], "selector": im["selector"]},
+                    judgment=res.get("judgment","Inconclusif"),
+                    explanation=res.get("explanation",""),
+                    suggestion=res.get("suggestion"),
+                    confidence=float(res.get("confidence",0.0)),
+                    processed_by_ai=True, ai_status="ok", ai_error=None,
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                    extras={"detected_text": res.get("detected_text","")}
+                ))
             processing_report["ocr_processed_ok"] = len(parsed)
         except HTTPException as e:
             processing_report["ocr_errors"] = len(candidates_ocr)
             for im in candidates_ocr:
-                findings.append({
-                    "criterion": "OCR_TEXT_IN_IMAGE",
-                    "rgaa": "1.5",
-                    "target": {"src": im["src"], "selector": im["selector"]},
-                    "judgment": "Inconclusif",
-                    "explanation": "Échec de l’évaluation IA OCR.",
-                    "suggestion": None,
-                    "confidence": 0.0,
-                    "detected_text": "",
-                    "processed_by_ai": True,
-                    "ai_status": "error",
-                    "ai_error": str(e.detail)[:500],
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="OCR_TEXT_IN_IMAGE", rgaa="1.5",
+                    target={"src": im["src"], "selector": im["selector"]},
+                    judgment="Inconclusif", explanation="Échec de l’évaluation IA OCR.",
+                    suggestion=None, confidence=0.0,
+                    processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                    extras={"detected_text": ""}
+                ))
 
-    # Structure visuelle vs DOM
+    # === D) Headings visuels vs DOM (IA vision + DOM)
     if req.filters.HEADINGS_VISUAL_SEMANTICS:
         dom_outline = extract_dom_outline(html)
         screenshot_ref = {}
@@ -364,190 +390,132 @@ async def audit(req: AuditRequest):
             screenshot_ref = {"image_b64": b64}
 
         if not screenshot_ref:
-            findings.append({
-                "criterion": "HEADINGS_VISUAL_SEMANTICS",
-                "rgaa": "9.1/9.2",
-                "target": {"src": None, "selector": "screenshot"},
-                "judgment": "Inconclusif",
-                "explanation": "Aucune capture fournie pour l’analyse visuelle.",
-                "suggestion": "Envoyer 'screenshot_url' ou 'screenshot_base64'.",
-                "confidence": 0.0,
-                "processed_by_ai": False,
-                "ai_status": "skipped",
-                "ai_error": None,
-                "visual_outline": [],
-                "dom_outline": dom_outline,
-                "evidence": {"model": None, "mode": "rule"}
-            })
+            findings.append(make_finding(
+                criterion="HEADINGS_VISUAL_SEMANTICS", rgaa="9.1/9.2",
+                target={"src": None, "selector": "screenshot"},
+                judgment="Inconclusif",
+                explanation="Aucune capture fournie pour l’analyse visuelle.",
+                suggestion="Envoyer 'screenshot_url' ou 'screenshot_base64'.",
+                confidence=0.0, processed_by_ai=False, ai_status="skipped", ai_error=None,
+                evidence={"model": None, "mode": "rule"},
+                extras={"visual_outline": [], "dom_outline": dom_outline}
+            ))
         else:
             try:
-                raw = await call_azure_chat(build_msgs_headings(screenshot_ref))
+                raw = await call_azure_chat(build_msgs_headings(screenshot_ref), max_tokens=220)
                 parsed = robust_json_parse(raw)  # dict attendu
                 visual_outline = parsed.get("visual_outline", []) if isinstance(parsed, dict) else []
                 judgment, explanation = compare_visual_vs_dom(visual_outline, dom_outline)
-                findings.append({
-                    "criterion": "HEADINGS_VISUAL_SEMANTICS",
-                    "rgaa": "9.1/9.2",
-                    "target": {"src": req.screenshot_url or "data:image/*;base64", "selector": "screenshot"},
-                    "judgment": judgment,
-                    "explanation": explanation,
-                    "suggestion": "Aligner H1–H6 DOM sur la hiérarchie visuelle." if judgment != "Conforme" else None,
-                    "confidence": 0.7 if judgment in ("Conforme","Non conforme") else 0.4,
-                    "processed_by_ai": True,
-                    "ai_status": "ok",
-                    "ai_error": None,
-                    "visual_outline": visual_outline,
-                    "dom_outline": dom_outline,
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="HEADINGS_VISUAL_SEMANTICS", rgaa="9.1/9.2",
+                    target={"src": req.screenshot_url or "data:image/*;base64", "selector": "screenshot"},
+                    judgment=judgment, explanation=explanation,
+                    suggestion=("Aligner H1–H6 DOM sur la hiérarchie visuelle." if judgment != "Conforme" else None),
+                    confidence=(0.7 if judgment in ("Conforme","Non conforme") else 0.4),
+                    processed_by_ai=True, ai_status="ok", ai_error=None,
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                    extras={"visual_outline": visual_outline, "dom_outline": dom_outline}
+                ))
+                processing_report["headings_processed"] = True
             except HTTPException as e:
-                findings.append({
-                    "criterion": "HEADINGS_VISUAL_SEMANTICS",
-                    "rgaa": "9.1/9.2",
-                    "target": {"src": req.screenshot_url or "data:image/*;base64", "selector": "screenshot"},
-                    "judgment": "Inconclusif",
-                    "explanation": "Échec de l’analyse IA de la capture d’écran.",
-                    "suggestion": None,
-                    "confidence": 0.0,
-                    "processed_by_ai": True,
-                    "ai_status": "error",
-                    "ai_error": str(e.detail)[:500],
-                    "visual_outline": [],
-                    "dom_outline": dom_outline,
-                    "evidence": {"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"}
-                })
+                findings.append(make_finding(
+                    criterion="HEADINGS_VISUAL_SEMANTICS", rgaa="9.1/9.2",
+                    target={"src": req.screenshot_url or "data:image/*;base64", "selector": "screenshot"},
+                    judgment="Inconclusif", explanation="Échec de l’analyse IA de la capture d’écran.",
+                    suggestion=None, confidence=0.0,
+                    processed_by_ai=True, ai_status="error", ai_error=str(e.detail)[:500],
+                    evidence={"model": AZURE_OPENAI_DEPLOYMENT, "mode": "vision"},
+                    extras={"visual_outline": [], "dom_outline": dom_outline}
+                ))
+                processing_report["headings_error"] = True
 
+    # === E) Pertinence libellé de lien (IA texte + heuristiques)
+    if req.filters.LINK_LABEL_PERTINENCE:
+        soup = BeautifulSoup(html, "html.parser")
+        seen_texts = {}
+        links = soup.find_all("a", href=True)
+        for a in links:
+            href = urljoin(str(req.url), a["href"])
+            text = a.get_text(strip=True)
+            title = a.get("title")
+            parent_text = a.find_parent().get_text(" ", strip=True) if a.find_parent() else ""
+            issues = []
+
+            # Heuristiques de base
+            if not text:
+                issues.append("Empty link text")
+            imgs = a.find_all("img")
+            if imgs and not text:
+                alt_texts = [img.get("alt", "") for img in imgs]
+                if not any(alt_texts):
+                    issues.append("Link contains only image(s) without alt text")
+
+            key = (text or "").strip().lower()
+            if key:
+                if key in seen_texts and seen_texts[key] != href:
+                    issues.append("Duplicate link text points to different destinations")
+                else:
+                    seen_texts[key] = href
+
+            # IA YES/NO — si texte présent
+            ai_answer = "SKIPPED"
+            if text:
+                try:
+                    raw = await call_azure_chat(build_msgs_link_yesno(text, href, parent_text[:1000]), max_tokens=5)
+                    ans = (raw or "").strip().upper()
+                    ai_answer = "YES" if ans.startswith("YES") else ("NO" if ans.startswith("NO") else "NO")
+                    if ai_answer == "NO":
+                        issues.append("Link text not explicit according to AI check")
+                except HTTPException as e:
+                    ai_answer = "ERROR"
+                    issues.append(f"AI check failed: {str(e.detail)[:200]}")
+
+            findings.append(make_finding(
+                criterion="LINK_LABEL_PERTINENCE", rgaa="8.x",
+                target={"href": href, "text": text, "title": title},
+                judgment=("Non conforme" if ("Empty link text" in issues or "Link contains only image(s) without alt text" in issues or ai_answer == "NO") else "Conforme"),
+                explanation=("Problèmes détectés: " + "; ".join(issues)) if issues else "Libellé de lien explicite.",
+                suggestion=(None if not issues else "Rédiger un libellé descriptif, éviter 'cliquez ici'."),
+                confidence=(0.8 if not issues else 0.6),
+                processed_by_ai=(text != ""),
+                ai_status=("ok" if ai_answer in ("YES","NO") else ("error" if ai_answer=="ERROR" else "skipped")),
+                ai_error=(None if ai_answer in ("YES","NO","SKIPPED") else "Azure check failed"),
+                evidence={"model": (AZURE_OPENAI_DEPLOYMENT if text else None), "mode": ("text" if text else "rule")},
+                extras={"ai_explicit": ai_answer, "issues": issues}
+            ))
+            processing_report["links_checked"] += 1
+            if ai_answer == "SKIPPED": processing_report["links_ai_skipped"] += 1
+            if ai_answer == "ERROR":  processing_report["links_ai_errors"]  += 1
+
+    # === Réponse
     return {
         "url": str(req.url),
         "summary": {
             "counts": {
                 "images_total": len(images),
-                "images_alt_missing": len(missing_alt),
-                "images_alt_tested": len(candidates_alt),
-                "images_ocr_tested": len(candidates_ocr),
-                "findings": len(findings)
+                "findings": len(findings),
+                "by_criterion": {
+                    "IMG_ALT_PERTINENCE": sum(1 for f in findings if f["criterion"]=="IMG_ALT_PERTINENCE"),
+                    "OCR_TEXT_IN_IMAGE":  sum(1 for f in findings if f["criterion"]=="OCR_TEXT_IN_IMAGE"),
+                    "HEADINGS_VISUAL_SEMANTICS": sum(1 for f in findings if f["criterion"]=="HEADINGS_VISUAL_SEMANTICS"),
+                    "LINK_LABEL_PERTINENCE": sum(1 for f in findings if f["criterion"]=="LINK_LABEL_PERTINENCE"),
+                }
             },
             "processing_report": processing_report,
             "notes": [
                 "RGAA 1.1: présence (règle) + pertinence (IA).",
                 "RGAA 1.5: texte dans l’image (IA).",
-                "RGAA 9.1/9.2: hiérarchie visuelle vs structure DOM."
+                "RGAA 9.1/9.2: hiérarchie visuelle vs structure DOM (capture d’écran).",
+                "RGAA 8.x: explicitation libellés (IA + heuristiques).",
+                "Cas Ambigu/Inconclusif -> vérification manuelle recommandée."
             ]
         },
         "findings": findings,
         "metadata": {
-            "models": [AZURE_OPENAI_DEPLOYMENT] if (candidates_alt or candidates_ocr or req.filters.HEADINGS_VISUAL_SEMANTICS) else [],
-            "filters": [k for k,v in req.filters.model_dump().items() if v]
+            "models": list({f["evidence"]["model"] for f in findings if f["evidence"]["model"]}),
+            "filters": [k for k,v in req.filters.model_dump().items() if v],
+            "page_lang": page_lang
         }
-    }
-
-# =========================
-# Endpoint /check-links-ai
-# =========================
-async def azure_yes_no_link_explicit(link_text: str, href: str, context_text: str) -> str:
-    # Dégradation propre si non configuré
-    if not (AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT and AZURE_OPENAI_API_KEY):
-        return "SKIPPED"
-    prompt = (
-        "You are an accessibility expert.\n"
-        f'Link text: "{link_text}"\n'
-        f'Destination URL: "{href}"\n'
-        f'Nearby context: "{context_text}"\n\n'
-        'Answer exactly "YES" or "NO": does this link text clearly convey the destination or action?'
-    )
-    messages = [{"role": "system", "content": prompt}]
-    raw = await call_azure_chat(messages)
-    return (raw or "").strip().split()[0].upper()
-
-@app.get("/check-links-ai")
-async def check_links_ai(url: str = Query(..., description="URL à auditer")):
-    # Reachability
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            await client.head(url, follow_redirects=True)
-    except Exception as e:
-        raise HTTPException(400, f"URL not reachable: {e}")
-
-    # HTML
-    html = await fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-
-    results = []
-    seen_texts = {}
-
-    # Anti-patterns
-    for div in soup.find_all("div", onclick=True):
-        results.append({
-            "element": "div",
-            "text": div.get_text(strip=True),
-            "issues": ["DIV used as link (onclick). Not semantically a link, not keyboard accessible."],
-            "html": str(div)[:1000]
-        })
-    for span in soup.find_all("span", onclick=True):
-        if span.get("role") == "link":
-            results.append({
-                "element": "span",
-                "text": span.get_text(strip=True),
-                "issues": ["SPAN role=link with onclick. Needs full ARIA/keyboard handling."],
-                "html": str(span)[:1000]
-            })
-    for button in soup.find_all("button", onclick=True):
-        onclick = button.get("onclick", "")
-        if "window.location" in onclick or "location.href" in onclick:
-            results.append({
-                "element": "button",
-                "text": button.get_text(strip=True),
-                "issues": ["BUTTON used for navigation (should be <a> for links)."],
-                "html": str(button)[:1000]
-            })
-
-    links = soup.find_all("a", href=True)
-    for a in links:
-        link_info = {
-            "href": urljoin(url, a["href"]),
-            "text": a.get_text(strip=True),
-            "title": a.get("title"),
-            "img_alt": None,
-            "issues": []
-        }
-
-        # Texte vide
-        if not link_info["text"]:
-            link_info["issues"].append("Empty link text")
-
-        # Image-only
-        imgs = a.find_all("img")
-        if imgs and not link_info["text"]:
-            alt_texts = [img.get("alt", "") for img in imgs]
-            link_info["img_alt"] = alt_texts
-            if not any(alt_texts):
-                link_info["issues"].append("Link contains only image(s) without alt text")
-
-        # Duplicats
-        text_key = (link_info["text"] or "").strip().lower()
-        if text_key:
-            if text_key in seen_texts:
-                if seen_texts[text_key] != link_info["href"]:
-                    link_info["issues"].append("Duplicate link text points to different destinations")
-            else:
-                seen_texts[text_key] = link_info["href"]
-
-        # IA YES/NO
-        parent_text = a.find_parent().get_text(" ", strip=True) if a.find_parent() else ""
-        if link_info["text"]:
-            ai_answer = await azure_yes_no_link_explicit(link_info["text"], link_info["href"], parent_text[:1000])
-            link_info["ai_explicit"] = ai_answer
-            if ai_answer == "NO":
-                link_info["issues"].append("Link text not explicit according to AI check")
-            if ai_answer == "SKIPPED":
-                link_info["issues"].append("AI check skipped (not configured)")
-
-        results.append(link_info)
-
-    return {
-        "url": url,
-        "links_report": results,
-        "stats": {"total_links": len(links), "items_reported": len(results)}
     }
 
 # =========================
@@ -555,7 +523,7 @@ async def check_links_ai(url: str = Query(..., description="URL à auditer")):
 # =========================
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "IA Accessibility Auditor"}
+    return {"status":"ok","service":"IA Accessibility Auditor (Unified)"}
 
 @app.head("/")
 def head_ok():
